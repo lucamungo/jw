@@ -31,15 +31,18 @@ jw output <path|name>       # Show recent output from a tab
 jw kill <path|name>         # Kill a tab
 jw format [path]            # Format Julia code (default: current dir)
 jw list                     # List active tabs
+jw prune                    # Kill tabs of deleted directories and finished REPLs
 ```
 
 `<path>` is a relative or absolute directory containing a `Project.toml`. As a convenience, bare names are looked up under `packages/` if that directory exists.
 
 ## How it works
 
-`jw` manages a tmux session (one per git repo) with a window per package. Each window holds a Julia REPL with `Revise`, `TestEnv`, and `TestItemRunner` preloaded. Tests run inside this warm session, skipping all startup and precompilation overhead.
+`jw` manages a tmux session (one per git repo checkout, keyed by its path) with a window per package. Each window holds a Julia REPL with `Revise`, `TestEnv`, and `TestItemRunner` preloaded. Tests run inside this warm session, skipping all startup and precompilation overhead.
 
 The formatter works the same way — a dedicated window with `JuliaFormatter` loaded, reused across invocations.
+
+A REPL exits on its own after `JW_IDLE_MINUTES` (default 120) without a `jw run` or `jw format`, so sessions left behind by agents or deleted worktrees don't pile up and fill memory and swap. A test run in progress never counts as idle. When Julia exits its window closes, and the session closes with its last window. `jw prune` cleans up tabs whose directory no longer exists.
 
 Before each test run, `jw` calls `Revise.revise()` and checks `Revise.errors()` — if Revise failed to pick up changes (e.g. syntax errors), it prints a warning suggesting a restart.
 

@@ -9,20 +9,34 @@
 #   jw kill <path|name>          Kill a tab
 #   jw format [path]             Format Julia code (defaults to current directory)
 #   jw list                      List active tabs
+#   jw prune                     Kill tabs of deleted directories and finished REPLs
+#
+# A REPL exits on its own after JW_IDLE_MINUTES (default 120) without a jw command.
 
 READY_SENTINEL="__JW_READY__"
 DONE_SENTINEL="__JW_DONE__"
+IDLE_MINUTES="${JW_IDLE_MINUTES:-120}"
 
-# Session name scoped to the git repo (or hostname if not in a repo)
+# Julia code run at REPL startup: exit once no jw command has arrived for IDLE_MINUTES.
+# jw run/format wrap their command in jw_busy() so a long test run is never cut off.
+# SIGHUP (sent when tmux closes the window) is ignored so Julia exits on stdin EOF instead
+# and runs its atexit hooks; otherwise TestEnv's temp project, which can hold an ~800 MB
+# CondaPkg environment, is left behind in the temp directory.
+IDLE_WATCHDOG="ccall(:signal, Ptr{Cvoid}, (Cint, Ptr{Cvoid}), 1, Ptr{Cvoid}(1)); const JW_LAST = Ref(time()); const JW_BUSY = Ref(false); function jw_busy(f); JW_BUSY[] = true; try; f(); finally; JW_BUSY[] = false; JW_LAST[] = time(); end; end; const JW_TIMER = Timer(_ -> (!JW_BUSY[] && time() - JW_LAST[] > $IDLE_MINUTES * 60 && exit()), 60; interval=60)"
+
+# Session name scoped to the git repo (or hostname if not in a repo). The path hash keeps
+# clones that share a basename (e.g. /tmp/a/repo and /tmp/b/repo) in separate sessions;
+# tmux would turn "." into "_" anyway.
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -n "$repo_root" ]; then
-    SESSION="jw-$(basename "$repo_root")"
+    base=$(basename "$repo_root")
+    SESSION="jw-${base//./_}-$(printf '%s' "$repo_root" | shasum | cut -c1-6)"
 else
     SESSION="jw-$(hostname -s)"
 fi
 
 ensure_session() {
-    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
         tmux new-session -d -s "$SESSION" -n _placeholder
     fi
 }
@@ -48,24 +62,20 @@ win_name() {
     echo "${name%.jl}"
 }
 
-start_tab() {
-    local dir="$1"
-    local win=$(win_name "$dir")
-    if [ ! -f "$dir/Project.toml" ]; then echo "No Project.toml in: $dir"; return 1; fi
+has_window() {
+    tmux list-windows -t "=$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$1"
+}
 
-    ensure_session
-
-    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win"; then
-        return 0
-    fi
-
-    tmux new-window -t "$SESSION" -n "$win" -c "$dir"
+# Start Julia in a new window and wait for the ready sentinel. The shell exits with
+# Julia so the window (and, with its last window, the session) goes away; on a failed
+# start it lingers briefly so the error can be read.
+launch_julia() {
+    local win="$1" julia_cmd="$2" timeout="$3"
     tmux send-keys -t "$SESSION:$win" \
-        "julia --project=@. -e 'using Revise; using TestEnv; TestEnv.activate(); using TestItemRunner; println(\"$READY_SENTINEL\")' -i" Enter
+        "$julia_cmd || sleep 120; exit" Enter
 
-    echo "Starting Julia for $win... waiting for REPL."
-    for i in $(seq 1 90); do
-        output=$(tmux capture-pane -t "$SESSION:$win" -p 2>/dev/null)
+    for i in $(seq 1 "$timeout"); do
+        output=$(tmux capture-pane -t "$SESSION:$win" -p -S - 2>/dev/null)
         if echo "$output" | grep -q "^${READY_SENTINEL}$"; then
             echo "Ready! (${i}s)"
             tmux kill-window -t "$SESSION:_placeholder" 2>/dev/null
@@ -83,35 +93,29 @@ start_tab() {
     return 1
 }
 
+start_tab() {
+    local dir="$1"
+    local win=$(win_name "$dir")
+    if [ ! -f "$dir/Project.toml" ]; then echo "No Project.toml in: $dir"; return 1; fi
+
+    ensure_session
+    if has_window "$win"; then return 0; fi
+
+    tmux new-window -t "$SESSION" -n "$win" -c "$dir"
+    echo "Starting Julia for $win... waiting for REPL."
+    launch_julia "$win" \
+        "julia --project=@. -e 'using Revise; using TestEnv; TestEnv.activate(); using TestItemRunner; $IDLE_WATCHDOG; println(\"$READY_SENTINEL\")' -i" 90
+}
+
 start_formatter() {
     ensure_session
     local win="formatter"
-    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win"; then
-        return 0
-    fi
+    if has_window "$win"; then return 0; fi
 
     tmux new-window -t "$SESSION" -n "$win"
-    tmux send-keys -t "$SESSION:$win" \
-        "julia -e 'using JuliaFormatter; println(\"$READY_SENTINEL\")' -i" Enter
-
     echo "Starting Julia with JuliaFormatter... waiting for REPL."
-    for i in $(seq 1 120); do
-        output=$(tmux capture-pane -t "$SESSION:$win" -p 2>/dev/null)
-        if echo "$output" | grep -q "^${READY_SENTINEL}$"; then
-            echo "Ready! (${i}s)"
-            tmux kill-window -t "$SESSION:_placeholder" 2>/dev/null
-            return 0
-        fi
-        if echo "$output" | grep -q "^ERROR:"; then
-            echo "Julia failed to start:"
-            echo "$output" | grep -A2 "ERROR:"
-            tmux kill-window -t "$SESSION:$win" 2>/dev/null
-            return 1
-        fi
-        sleep 1
-    done
-    echo "Timed out waiting for Julia to start."
-    return 1
+    launch_julia "$win" \
+        "julia -e 'using JuliaFormatter; $IDLE_WATCHDOG; println(\"$READY_SENTINEL\")' -i" 120
 }
 
 case "${1:-help}" in
@@ -121,7 +125,7 @@ case "${1:-help}" in
         dir=$(resolve_pkg_dir "$input")
         if [ -z "$dir" ]; then echo "Directory not found: $input"; exit 1; fi
         win=$(win_name "$dir")
-        if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win"; then
+        if has_window "$win"; then
             echo "Tab '$win' already exists. Use 'jw kill $win' first."
             exit 1
         fi
@@ -136,7 +140,7 @@ case "${1:-help}" in
         if [ -z "$dir" ]; then echo "Directory not found: $input"; exit 1; fi
         win=$(win_name "$dir")
 
-        if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win"; then
+        if ! has_window "$win"; then
             echo "No tab for '$win'. Starting automatically..."
             start_tab "$dir" || exit 1
         fi
@@ -152,7 +156,7 @@ case "${1:-help}" in
         tmux clear-history -t "$SESSION:$win"
         tmux send-keys -t "$SESSION:$win" "Revise.revise(); let errs=Revise.errors(); (errs === nothing || isempty(errs)) || println(\"WARNING: Revise errors — restart recommended: \", keys(errs)); end" Enter
         sleep 0.5
-        tmux send-keys -t "$SESSION:$win" "try; $cmd; catch e; println(e); end; println(\"$DONE_SENTINEL\")" Enter
+        tmux send-keys -t "$SESSION:$win" "jw_busy() do; try; $cmd; catch e; println(e); end; end; println(\"$DONE_SENTINEL\")" Enter
         echo "Tests running in $win..."
 
         for i in $(seq 1 300); do
@@ -206,7 +210,7 @@ case "${1:-help}" in
         if [ -z "$target" ]; then echo "Directory not found: $2"; exit 1; fi
 
         win="formatter"
-        if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win"; then
+        if ! has_window "$win"; then
             echo "No formatter tab. Starting automatically..."
             start_formatter || exit 1
         fi
@@ -215,7 +219,7 @@ case "${1:-help}" in
         sleep 0.2
         tmux clear-history -t "$SESSION:$win"
         tmux send-keys -t "$SESSION:$win" \
-            "format(\"$target\"); println(\"$DONE_SENTINEL\")" Enter
+            "jw_busy(() -> format(\"$target\")); println(\"$DONE_SENTINEL\")" Enter
         echo "Formatting $target..."
 
         for i in $(seq 1 300); do
@@ -231,11 +235,23 @@ case "${1:-help}" in
         ;;
 
     list)
-        if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
             echo "No jw session running."
             exit 0
         fi
-        tmux list-windows -t "$SESSION" -F '#{window_name} (#{pane_current_command})'
+        tmux list-windows -t "=$SESSION" -F '#{window_name} (#{pane_current_command})'
+        ;;
+
+    prune)
+        # Across all jw sessions: kill windows whose directory is gone or whose Julia has
+        # exited (a bare shell left by older jw versions), plus leftover placeholders.
+        n=0
+        while IFS='|' read -r target cmd path; do
+            if [ ! -d "$path" ] || [ "$cmd" != "julia" ]; then
+                tmux kill-window -t "$target" 2>/dev/null && n=$((n + 1))
+            fi
+        done < <(tmux list-windows -a -F '#{session_name}:#{window_index}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null | grep '^jw-')
+        echo "Pruned $n tab(s)."
         ;;
 
     help|*)
@@ -247,7 +263,9 @@ case "${1:-help}" in
         echo "  jw kill <path|name>         Kill a tab"
         echo "  jw format [path]            Format Julia code (default: current dir)"
         echo "  jw list                     List active tabs"
+        echo "  jw prune                    Kill tabs of deleted dirs and finished REPLs"
         echo ""
         echo "  <path> can be a relative/absolute dir or a name under packages/"
+        echo "  REPLs exit after \$JW_IDLE_MINUTES (default 120) without a jw command."
         ;;
 esac

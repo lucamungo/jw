@@ -19,7 +19,10 @@ IDLE_MINUTES="${JW_IDLE_MINUTES:-120}"
 
 # Julia code run at REPL startup: exit once no jw command has arrived for IDLE_MINUTES.
 # jw run/format wrap their command in jw_busy() so a long test run is never cut off.
-IDLE_WATCHDOG="const JW_LAST = Ref(time()); const JW_BUSY = Ref(false); function jw_busy(f); JW_BUSY[] = true; try; f(); finally; JW_BUSY[] = false; JW_LAST[] = time(); end; end; const JW_TIMER = Timer(_ -> (!JW_BUSY[] && time() - JW_LAST[] > $IDLE_MINUTES * 60 && exit()), 60; interval=60)"
+# SIGHUP (sent when tmux closes the window) is ignored so Julia exits on stdin EOF instead
+# and runs its atexit hooks; otherwise TestEnv's temp project, which can hold an ~800 MB
+# CondaPkg environment, is left behind in the temp directory.
+IDLE_WATCHDOG="ccall(:signal, Ptr{Cvoid}, (Cint, Ptr{Cvoid}), 1, Ptr{Cvoid}(1)); const JW_LAST = Ref(time()); const JW_BUSY = Ref(false); function jw_busy(f); JW_BUSY[] = true; try; f(); finally; JW_BUSY[] = false; JW_LAST[] = time(); end; end; const JW_TIMER = Timer(_ -> (!JW_BUSY[] && time() - JW_LAST[] > $IDLE_MINUTES * 60 && exit()), 60; interval=60)"
 
 # Session name scoped to the git repo (or hostname if not in a repo). The path hash keeps
 # clones that share a basename (e.g. /tmp/a/repo and /tmp/b/repo) in separate sessions;
